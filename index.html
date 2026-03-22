@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GitaFlow</title>
+    <meta
+      name="description"
+      content="GitaFlow is a local audio-first MVP delivering short, practical Gita-inspired wisdom episodes."
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape shape-a"></div>
+    <div class="bg-shape shape-b"></div>
+    <div class="bg-shape shape-c"></div>
+
+    <div class="container">
+      <header class="topbar card">
+        <div>
+          <p class="kicker">Local MVP</p>
+          <h1>GitaFlow</h1>
+        </div>
+        <div class="topbar-actions">
+          <div id="authArea" class="auth-area"></div>
+          <button id="resetProfile" class="ghost-btn" type="button">Reset Profile</button>
+        </div>
+      </header>
+
+      <main id="app"></main>
+    </div>
+
+    <div id="episodeModal" class="modal hidden" aria-hidden="true"></div>
+    <div id="playerDock" class="player-dock hidden"></div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
