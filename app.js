@@ -940,7 +940,7 @@ function renderAuth() {
 
   authAreaEl.innerHTML = `
     <div class="auth-user">
-      <span class="auth-chip">${escapeHtml(displayName)}</span>
+      <button class="soft-btn" data-action="go-dashboard" type="button" title="Signed in as ${escapeHtml(displayName)}">Dashboard</button>
       <button class="soft-btn" data-action="auth-logout" type="button">Sign out</button>
     </div>
   `;
@@ -1141,12 +1141,27 @@ async function signInWithGoogle() {
 
 async function signOutUser() {
   if (!supabaseClient) return;
-  const { error } = await supabaseClient.auth.signOut();
+  const { error } = await supabaseClient.auth.signOut({ scope: 'local' });
+
+  if (window.location.hash && /access_token=|refresh_token=|provider_token=|token_type=|expires_in=/i.test(window.location.hash)) {
+    const cleanUrl = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState({}, document.title, cleanUrl);
+  }
+
+  authState.user = null;
+  authState.status = 'signed_out';
+  authState.providerError = '';
+  resetRemoteData();
+  setOnboardingMode(null);
+  renderAuth();
+  render();
+
   if (error) {
-    toast('Could not sign out');
     console.warn('Sign out failed:', error.message);
+    toast('Signed out locally');
     return;
   }
+
   toast('Signed out');
 }
 
@@ -1435,6 +1450,21 @@ function handleOnboardingSelection(field, rawValue) {
 function openPreferencesEditor() {
   if (!isUserSignedIn()) return;
   setOnboardingMode('edit');
+  render();
+}
+
+function goToDashboard() {
+  if (!isUserSignedIn()) return;
+  if (state.ui.onboardingMode === 'blocking') {
+    toast('Complete setup to access dashboard');
+    return;
+  }
+
+  state.ui.onboardingMode = null;
+  state.ui.onboardingStep = 0;
+  state.ui.modalEpisodeId = null;
+  state.tab = 'home';
+  persist();
   render();
 }
 
@@ -2422,6 +2452,11 @@ document.addEventListener('click', (event) => {
 
   if (action === 'auth-logout') {
     signOutUser();
+    return;
+  }
+
+  if (action === 'go-dashboard') {
+    goToDashboard();
     return;
   }
 
