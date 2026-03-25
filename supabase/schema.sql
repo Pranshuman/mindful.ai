@@ -37,6 +37,7 @@ create index if not exists episodes_variants_gin_idx on public.episodes using gi
 
 create table if not exists public.user_profiles (
   id uuid primary key references auth.users (id) on delete cascade,
+  email text,
   full_name text,
   username text unique,
   avatar_url text,
@@ -45,11 +46,43 @@ create table if not exists public.user_profiles (
   preferred_episode_length_min integer
     check (preferred_episode_length_min in (3, 5, 10)),
   goals text[] not null default '{}',
+  preferred_tags text[] not null default '{}',
+  preferred_time_slot text,
   timezone text not null default 'Asia/Kolkata',
   onboarding_completed boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.user_profiles
+  add column if not exists email text;
+
+alter table public.user_profiles
+  add column if not exists preferred_tags text[] not null default '{}';
+
+alter table public.user_profiles
+  add column if not exists preferred_time_slot text;
+
+update public.user_profiles
+set preferred_tags = '{}'
+where preferred_tags is null;
+
+alter table public.user_profiles
+  alter column preferred_tags set default '{}';
+
+alter table public.user_profiles
+  alter column preferred_tags set not null;
+
+alter table public.user_profiles
+  drop constraint if exists user_profiles_preferred_time_slot_check;
+
+alter table public.user_profiles
+  add constraint user_profiles_preferred_time_slot_check
+  check (preferred_time_slot is null or preferred_time_slot in ('Morning', 'Afternoon', 'Evening', 'Night'));
+
+create unique index if not exists user_profiles_email_unique_idx
+  on public.user_profiles (email)
+  where email is not null;
 
 create table if not exists public.user_episode_progress (
   user_id uuid not null references auth.users (id) on delete cascade,
@@ -106,13 +139,21 @@ security definer
 set search_path = public
 as $$
 begin
-  insert into public.user_profiles (id, full_name, avatar_url)
+  insert into public.user_profiles (id, email, full_name, avatar_url)
   values (
     new.id,
+    new.email,
     coalesce(new.raw_user_meta_data ->> 'full_name', ''),
     new.raw_user_meta_data ->> 'avatar_url'
   )
-  on conflict (id) do nothing;
+  on conflict (id) do update
+  set
+    email = excluded.email,
+    full_name = case
+      when excluded.full_name is null or excluded.full_name = '' then public.user_profiles.full_name
+      else excluded.full_name
+    end,
+    avatar_url = coalesce(excluded.avatar_url, public.user_profiles.avatar_url);
 
   return new;
 end;
@@ -120,7 +161,7 @@ $$;
 
 drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
-after insert on auth.users
+after insert or update on auth.users
 for each row execute function public.handle_new_user();
 
 alter table public.episodes enable row level security;

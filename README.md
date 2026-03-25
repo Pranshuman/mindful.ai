@@ -4,7 +4,7 @@ Local Node.js MVP based on your PRD, modeled as a release stream.
 
 ## What changed
 
-- no onboarding preference options
+- 5-step onboarding captures user preferences after first login
 - app behaves like a show where episodes release on schedule
 - latest released episode is highlighted on Home
 - upcoming episodes are visible but locked until release date
@@ -13,22 +13,15 @@ Local Node.js MVP based on your PRD, modeled as a release stream.
 ## Run
 
 ```bash
-cd /Users/pranshumansinghbhouriyal/Desktop/Mindful/gitaflow_local_app
+cd /Users/pranshumansinghbhouriyal/Desktop/Mindfull
 npm start
 ```
 
-If port `4173` is already in use:
-
-```bash
-cd /Users/pranshumansinghbhouriyal/Desktop/Mindful/gitaflow_local_app
-PORT=4174 npm start
-```
-
-Open `http://127.0.0.1:4173` (or `4174` if changed).
+Open `http://127.0.0.1:4173`.
 
 ## Supabase Setup
 
-1. Create a `.env` file in `/Users/pranshumansinghbhouriyal/Desktop/Mindful/gitaflow_local_app` using `.env.example`.
+1. Create a `.env` file in `/Users/pranshumansinghbhouriyal/Desktop/Mindfull` using `.env.example`.
 2. Add:
    - `SUPABASE_URL`
    - `SUPABASE_KEY` (used by server for episode fetch)
@@ -76,4 +69,4 @@ Ready-to-run schema script (episodes + user profiles + user data tables) is avai
 3. In Supabase Auth URL settings, add local redirects:
    - `http://127.0.0.1:4173`
    - `http://localhost:4173`
-4. Restart app and use the new "Continue with Google" button in the header.
+4. Restart app and use the "Continue with Google" button on the login screen.

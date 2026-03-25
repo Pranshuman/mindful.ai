@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GitaFlow</title>
+    <title>Mindful</title>
     <meta
       name="description"
-      content="GitaFlow is a local audio-first MVP delivering short, practical Gita-inspired wisdom episodes."
+      content="Mindful is a short-form audio experience for calm focus, clarity, and daily consistency."
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -17,12 +17,15 @@
 
     <div class="container">
       <header class="topbar card">
-        <div>
-          <p class="kicker">Local MVP</p>
-          <h1>GitaFlow</h1>
+        <div class="brand-lockup">
+          <h1>Mindful</h1>
+          <p class="brand-tagline">Short wisdom episodes for calm, focus, and clarity.</p>
         </div>
         <div class="topbar-actions">
           <div id="authArea" class="auth-area"></div>
+          <button id="openPreferences" class="ghost-btn" type="button" data-action="open-preferences" hidden>
+            Preferences
+          </button>
           <button id="resetProfile" class="ghost-btn" type="button">Reset Profile</button>
         </div>
       </header>

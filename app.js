@@ -6,6 +6,33 @@ const RELEASE_GAP_DAYS = 2;
 const FILTERS = ['All', 'Released', 'Coming Soon'];
 const SPEEDS = [0.85, 1, 1.15, 1.3];
 const AUTH_REDIRECT_PATH = '/';
+const LANGUAGE_OPTIONS = ['English', 'Hindi', 'Hinglish'];
+const GOAL_OPTIONS = [
+  'Reduce Stress',
+  'Improve Focus',
+  'Better Decisions',
+  'Build Discipline',
+  'Sleep Better',
+  'Find Purpose'
+];
+const TIME_SLOT_OPTIONS = ['Morning', 'Afternoon', 'Evening', 'Night'];
+const LENGTH_OPTIONS = [3, 5, 10];
+
+const GOAL_TAG_MAP = {
+  'Reduce Stress': ['stress', 'anxiety', 'peace', 'balance'],
+  'Improve Focus': ['focus', 'mind', 'discipline'],
+  'Better Decisions': ['decision', 'duty', 'clarity'],
+  'Build Discipline': ['discipline', 'work', 'focus'],
+  'Sleep Better': ['sleep', 'peace', 'anxiety'],
+  'Find Purpose': ['purpose', 'identity', 'duty']
+};
+
+const TIME_SLOT_TAG_MAP = {
+  Morning: ['discipline', 'focus', 'purpose'],
+  Afternoon: ['work', 'stress', 'clarity', 'decision'],
+  Evening: ['relationships', 'balance', 'peace'],
+  Night: ['sleep', 'anxiety', 'overthinking', 'peace']
+};
 
 const LOCAL_EPISODES = [
   {
@@ -322,7 +349,109 @@ const LOCAL_EPISODES = [
   }
 ];
 
-let EPISODES = normalizeEpisodes(LOCAL_EPISODES);
+// Episodes are API-driven only. Keep empty until /api/episodes responds.
+let EPISODES = [];
+
+function defaultPreferences() {
+  return {
+    preferred_language: null,
+    preferred_episode_length_min: null,
+    goals: [],
+    preferred_tags: [],
+    preferred_time_slot: null,
+    onboarding_completed: false
+  };
+}
+
+function normalizeChoiceList(values, allowed, maxCount) {
+  if (!Array.isArray(values)) return [];
+  const allowedSet = new Set(allowed);
+  const deduped = [];
+  for (const raw of values) {
+    const value = String(raw || '').trim();
+    if (!value || !allowedSet.has(value) || deduped.includes(value)) continue;
+    deduped.push(value);
+    if (maxCount && deduped.length >= maxCount) break;
+  }
+  return deduped;
+}
+
+function normalizeTopicList(values, maxCount = 3) {
+  if (!Array.isArray(values)) return [];
+  const deduped = [];
+  for (const raw of values) {
+    const value = String(raw || '').trim().toLowerCase();
+    if (!value || deduped.includes(value)) continue;
+    deduped.push(value);
+    if (deduped.length >= maxCount) break;
+  }
+  return deduped;
+}
+
+function allTopicOptions() {
+  const topics = new Set();
+  EPISODES.forEach((episode) => {
+    episode.tags.forEach((tag) => {
+      const normalized = String(tag || '').trim().toLowerCase();
+      if (normalized) topics.add(normalized);
+    });
+  });
+  return Array.from(topics).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizePreferences(raw = {}) {
+  const preferredLanguage = LANGUAGE_OPTIONS.includes(raw.preferred_language)
+    ? raw.preferred_language
+    : null;
+  const preferredLength = LENGTH_OPTIONS.includes(Number(raw.preferred_episode_length_min))
+    ? Number(raw.preferred_episode_length_min)
+    : null;
+  const preferredTimeSlot = TIME_SLOT_OPTIONS.includes(raw.preferred_time_slot)
+    ? raw.preferred_time_slot
+    : null;
+
+  return {
+    preferred_language: preferredLanguage,
+    preferred_episode_length_min: preferredLength,
+    goals: normalizeChoiceList(raw.goals, GOAL_OPTIONS, 2),
+    preferred_tags: normalizeTopicList(raw.preferred_tags, 3),
+    preferred_time_slot: preferredTimeSlot,
+    onboarding_completed: Boolean(raw.onboarding_completed)
+  };
+}
+
+function onboardingRequired(preferences) {
+  const normalized = normalizePreferences(preferences);
+  if (!normalized.onboarding_completed) return true;
+  if (!LANGUAGE_OPTIONS.includes(normalized.preferred_language)) return true;
+  if (!LENGTH_OPTIONS.includes(Number(normalized.preferred_episode_length_min))) return true;
+  if (!TIME_SLOT_OPTIONS.includes(normalized.preferred_time_slot)) return true;
+  if (!Array.isArray(normalized.goals) || normalized.goals.length < 1 || normalized.goals.length > 2) return true;
+  if (!Array.isArray(normalized.preferred_tags) || normalized.preferred_tags.length < 1 || normalized.preferred_tags.length > 3) return true;
+  return false;
+}
+
+function activeLanguage() {
+  return state?.preferences?.preferred_language || APP_LANGUAGE;
+}
+
+function speechLocaleForLanguage(language) {
+  if (language === 'Hindi') return 'hi-IN';
+  if (language === 'Hinglish') return 'en-IN';
+  return 'en-US';
+}
+
+function preferencesPayload(preferences) {
+  const normalized = normalizePreferences(preferences);
+  return {
+    preferred_language: normalized.preferred_language,
+    preferred_episode_length_min: normalized.preferred_episode_length_min,
+    goals: normalized.goals,
+    preferred_tags: normalized.preferred_tags,
+    preferred_time_slot: normalized.preferred_time_slot,
+    onboarding_completed: normalized.onboarding_completed
+  };
+}
 
 function fallbackReleaseAt(index) {
   return new Date(RELEASE_START.getTime() + index * RELEASE_GAP_DAYS * 24 * 60 * 60 * 1000);
@@ -393,6 +522,7 @@ const modalEl = document.getElementById('episodeModal');
 const playerEl = document.getElementById('playerDock');
 const toastEl = document.getElementById('toast');
 const resetButton = document.getElementById('resetProfile');
+const preferencesButton = document.getElementById('openPreferences');
 const authAreaEl = document.getElementById('authArea');
 
 const DEFAULT_STATE = {
@@ -400,8 +530,11 @@ const DEFAULT_STATE = {
   ui: {
     search: '',
     filter: 'All',
-    modalEpisodeId: null
+    modalEpisodeId: null,
+    onboardingMode: null,
+    onboardingStep: 0
   },
+  preferences: defaultPreferences(),
   savedIds: [],
   recentIds: [],
   progress: {},
@@ -426,12 +559,50 @@ let speechToken = null;
 let lastTick = 0;
 let supabaseClient = null;
 let authSubscription = null;
+let onboardingDraft = normalizePreferences(state.preferences);
+let onboardingSaving = false;
+let remoteSyncInFlight = false;
+let remoteData = {
+  me: null,
+  dashboard: null,
+  recommendations: [],
+  library: null,
+  progress: null
+};
 
 const authState = {
   enabled: false,
   status: 'loading',
-  user: null
+  user: null,
+  providerError: ''
 };
+
+function resetRemoteData() {
+  remoteData = {
+    me: null,
+    dashboard: null,
+    recommendations: [],
+    library: null,
+    progress: null
+  };
+}
+
+function isUserSignedIn() {
+  return Boolean(authState.user);
+}
+
+function hideOverlays() {
+  clearTick();
+  clearSleepTimer();
+  stopSpeech();
+
+  modalEl.classList.add('hidden');
+  modalEl.setAttribute('aria-hidden', 'true');
+  modalEl.innerHTML = '';
+
+  playerEl.classList.add('hidden');
+  playerEl.innerHTML = '';
+}
 
 function reconcileStateWithEpisodes() {
   const knownIds = new Set(EPISODES.map((episode) => episode.id));
@@ -467,10 +638,8 @@ async function hydrateEpisodesFromApi() {
     if (!response.ok) return;
 
     const payload = await response.json();
-    if (!Array.isArray(payload.episodes) || payload.episodes.length === 0) return;
-
-    const normalized = normalizeEpisodes(payload.episodes);
-    if (!normalized.length) return;
+    const episodes = Array.isArray(payload.episodes) ? payload.episodes : [];
+    const normalized = normalizeEpisodes(episodes);
 
     EPISODES = normalized;
     reconcileStateWithEpisodes();
@@ -482,16 +651,271 @@ async function hydrateEpisodesFromApi() {
     persist();
     render();
 
-    if (payload.source === 'supabase') {
+    if (payload.source === 'supabase' && normalized.length > 0) {
       toast('Synced latest releases from Supabase');
     }
   } catch (error) {
-    console.warn('Episode hydration failed. Using local episodes.', error);
+    console.warn('Episode hydration failed.', error);
   }
 }
 
 function authDisplayName(user) {
   return user?.user_metadata?.full_name || user?.user_metadata?.name || user?.email || 'Signed in';
+}
+
+function profilePayloadFromUser(user) {
+  if (!user?.id) return null;
+
+  return {
+    email: user.email || null,
+    full_name: user?.user_metadata?.full_name || user?.user_metadata?.name || null,
+    avatar_url: user?.user_metadata?.avatar_url || null
+  };
+}
+
+async function upsertUserProfile(payload, { showToastOnError = false } = {}) {
+  if (!payload || !isUserSignedIn()) return false;
+  const response = await apiFetchJson('/api/me', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok || response.payload?.ok === false) {
+    console.warn('Could not sync user profile:', response.payload?.details || response.status);
+    if (showToastOnError) {
+      toast('Could not save preferences. Please retry.');
+    }
+    return false;
+  }
+
+  const nextProfile = response.payload?.profile || null;
+  if (nextProfile) {
+    setPreferencesFromSource(nextProfile);
+  }
+  if (response.payload?.user) {
+    remoteData.me = {
+      ...(remoteData.me || {}),
+      user: response.payload.user,
+      profile: nextProfile || remoteData.me?.profile || null
+    };
+  }
+  return true;
+}
+
+async function syncUserProfile(user) {
+  if (!supabaseClient || !user?.id) return;
+  const payload = profilePayloadFromUser(user);
+  if (!payload) return;
+  await upsertUserProfile(payload);
+}
+
+async function fetchUserProfile(userId) {
+  if (!supabaseClient || !userId) return null;
+  const response = await apiFetchJson('/api/me');
+  if (!response.ok) {
+    console.warn('Could not load user preferences:', response.payload?.details || response.status);
+    toast('Could not load preferences. Using local defaults.');
+    return null;
+  }
+  const profile = response.payload?.profile || null;
+  const responseUserId = response.payload?.user?.id || '';
+  if (responseUserId && responseUserId !== userId) {
+    return null;
+  }
+  return profile;
+}
+
+function setPreferencesFromSource(source) {
+  state.preferences = normalizePreferences(source || state.preferences);
+  onboardingDraft = normalizePreferences(state.preferences);
+  persist();
+}
+
+function setOnboardingMode(mode = null) {
+  state.ui.onboardingMode = mode;
+  state.ui.onboardingStep = 0;
+  if (mode) {
+    onboardingDraft = normalizePreferences(state.preferences);
+  }
+  persist();
+}
+
+function needsBlockingOnboarding() {
+  return onboardingRequired(state.preferences);
+}
+
+async function accessTokenForApi() {
+  if (!supabaseClient) return '';
+  try {
+    const {
+      data: { session }
+    } = await supabaseClient.auth.getSession();
+    return session?.access_token || '';
+  } catch (_error) {
+    return '';
+  }
+}
+
+async function apiFetchJson(path, options = {}) {
+  const token = await accessTokenForApi();
+  const headers = {
+    Accept: 'application/json',
+    ...(options.headers || {})
+  };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  if (options.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const response = await fetch(path, {
+    ...options,
+    headers
+  });
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = null;
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload
+  };
+}
+
+function normalizeRecommendationItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item, index) => {
+      if (!item || typeof item !== 'object' || !item.episode) return null;
+      return {
+        ...item,
+        episode: normalizeEpisode(item.episode, index)
+      };
+    })
+    .filter(Boolean);
+}
+
+function applyRemoteLibrary(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  if (Array.isArray(payload.saved_ids)) {
+    state.savedIds = payload.saved_ids.map((item) => String(item)).filter(Boolean);
+  }
+  if (Array.isArray(payload.recent_ids)) {
+    state.recentIds = payload.recent_ids.map((item) => String(item)).filter(Boolean).slice(0, 12);
+  }
+}
+
+function applyRemoteProgress(payload) {
+  if (!payload || !Array.isArray(payload.items)) return;
+  const nextProgress = {};
+  const recent = [];
+  payload.items.forEach((row) => {
+    const episodeId = String(row.episode_id || '');
+    if (!episodeId) return;
+    const percent = Number(row.progress_percent || 0);
+    nextProgress[episodeId] = { percent };
+    recent.push(episodeId);
+  });
+  state.progress = nextProgress;
+  if (recent.length) {
+    state.recentIds = recent.filter((id, index) => recent.indexOf(id) === index).slice(0, 12);
+  }
+}
+
+async function refreshRemoteData({ silent = true } = {}) {
+  if (!isUserSignedIn() || !supabaseClient) return;
+  if (remoteSyncInFlight) return;
+  remoteSyncInFlight = true;
+
+  try {
+    const [meRes, dashboardRes, recRes, libraryRes, progressRes] = await Promise.all([
+      apiFetchJson('/api/me'),
+      apiFetchJson('/api/dashboard'),
+      apiFetchJson('/api/recommendations'),
+      apiFetchJson('/api/library'),
+      apiFetchJson('/api/progress')
+    ]);
+
+    if (meRes.ok) {
+      remoteData.me = meRes.payload;
+    }
+    if (dashboardRes.ok) {
+      const dashboardPayload = dashboardRes.payload || null;
+      if (dashboardPayload && dashboardPayload.featured?.episode) {
+        dashboardPayload.featured = {
+          ...dashboardPayload.featured,
+          episode: normalizeEpisode(dashboardPayload.featured.episode, 0)
+        };
+      }
+      if (dashboardPayload?.latest_release) {
+        dashboardPayload.latest_release = normalizeEpisode(dashboardPayload.latest_release, 0);
+      }
+      remoteData.dashboard = dashboardPayload;
+    }
+    if (recRes.ok) {
+      remoteData.recommendations = normalizeRecommendationItems(recRes.payload?.items);
+    }
+    if (libraryRes.ok) {
+      remoteData.library = libraryRes.payload || null;
+      applyRemoteLibrary(libraryRes.payload);
+    }
+    if (progressRes.ok) {
+      remoteData.progress = progressRes.payload || null;
+      applyRemoteProgress(progressRes.payload);
+    }
+
+    persist();
+    renderAuth();
+    render();
+  } catch (error) {
+    console.warn('Could not refresh remote data:', error.message);
+    if (!silent) {
+      toast('Could not sync live dashboard data.');
+    }
+  } finally {
+    remoteSyncInFlight = false;
+  }
+}
+
+async function syncSaveToApi(episodeId, saved) {
+  if (!isUserSignedIn()) return;
+  const response = await apiFetchJson('/api/library', {
+    method: 'POST',
+    body: JSON.stringify({
+      episode_id: episodeId,
+      saved
+    })
+  });
+  if (!response.ok || response.payload?.ok === false) {
+    console.warn('Could not sync save state:', response.payload?.details || response.status);
+    return;
+  }
+  await refreshRemoteData({ silent: true });
+}
+
+async function syncProgressToApi({ episodeId, percent, event = '', refreshDashboard = false }) {
+  if (!isUserSignedIn() || !episodeId) return;
+  const response = await apiFetchJson('/api/progress', {
+    method: 'POST',
+    body: JSON.stringify({
+      episode_id: episodeId,
+      progress_percent: Number(percent),
+      event
+    })
+  });
+  if (!response.ok || response.payload?.ok === false) {
+    console.warn('Could not sync progress:', response.payload?.details || response.status);
+    return;
+  }
+  if (refreshDashboard) {
+    await refreshRemoteData({ silent: true });
+  }
 }
 
 function renderAuth() {
@@ -508,20 +932,83 @@ function renderAuth() {
   }
 
   if (!authState.user) {
-    authAreaEl.innerHTML = `<button class="primary-btn" data-action="auth-google" type="button">Continue with Google</button>`;
+    authAreaEl.innerHTML = '';
     return;
   }
 
+  const displayName = remoteData.me?.user?.full_name || authDisplayName(authState.user);
+
   authAreaEl.innerHTML = `
     <div class="auth-user">
-      <span class="auth-chip">${escapeHtml(authDisplayName(authState.user))}</span>
+      <span class="auth-chip">${escapeHtml(displayName)}</span>
       <button class="soft-btn" data-action="auth-logout" type="button">Sign out</button>
     </div>
   `;
 }
 
+function renderAuthGate() {
+  const isLoading = authState.status === 'loading';
+  const loginReady = authState.enabled && !authState.user && !authState.providerError;
+  const loginUnavailable = !authState.enabled && !isLoading;
+  const providerBlocked = Boolean(authState.providerError);
+  const releasedCount = getReleasedEpisodes().length;
+  const upcomingCount = getUpcomingEpisodes().length;
+  const statusMessage = isLoading
+    ? 'Checking your session and preparing Google sign-in...'
+    : loginReady
+      ? 'Create your account with Google to unlock personalized episodes, saved picks, and progress sync.'
+      : providerBlocked
+        ? authState.providerError
+        : 'Google login is currently unavailable for this build.';
+
+  appEl.innerHTML = `
+    <section class="auth-gate card">
+      <div class="auth-gate-shell">
+        <div class="auth-gate-story">
+          <p class="kicker">Mindful Start</p>
+          <h2>Build calm momentum in 5-minute episodes.</h2>
+          <p class="helper">Short Gita-inspired audio sessions personalized around your language, goals, and listening rhythm.</p>
+          <div class="hero-pills">
+            <span class="hero-pill">${releasedCount} episodes live</span>
+            <span class="hero-pill">${upcomingCount} upcoming</span>
+            <span class="hero-pill">Personalized recommendations</span>
+          </div>
+          <div class="auth-gate-highlights">
+            <article class="auth-feature">
+              <strong>For You feed</strong>
+              <p>Recommendations ranked by your goals, topics, and preferred duration.</p>
+            </article>
+            <article class="auth-feature">
+              <strong>Progress memory</strong>
+              <p>Continue listening from where you paused, across sessions.</p>
+            </article>
+            <article class="auth-feature">
+              <strong>Focus-first design</strong>
+              <p>No clutter, just a clean stream for daily mental clarity.</p>
+            </article>
+          </div>
+        </div>
+
+        <div class="auth-gate-panel">
+          <p class="label">Get Started</p>
+          <h3>Create your free account</h3>
+          <p class="helper">${statusMessage}</p>
+          <div class="auth-gate-actions">
+            ${loginReady ? '<button class="google-btn" data-action="auth-google" type="button"><span class="google-mark">G</span>Start with Google</button>' : ''}
+            ${isLoading ? '<span class="auth-note">Please wait...</span>' : ''}
+            ${loginUnavailable ? '<p class="auth-alert">Configure Supabase auth keys in Vercel to enable Google login.</p>' : ''}
+            ${providerBlocked ? '<p class="auth-alert">Google provider is disabled in Supabase Auth. Enable it and retry.</p>' : ''}
+          </div>
+          <p class="note">No password setup needed. We only sync profile, preferences, and listening progress.</p>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 async function initAuth() {
   renderAuth();
+  render();
 
   try {
     const response = await fetch('/api/auth-config', {
@@ -532,6 +1019,7 @@ async function initAuth() {
       authState.enabled = false;
       authState.status = 'disabled';
       renderAuth();
+      render();
       return;
     }
 
@@ -540,6 +1028,7 @@ async function initAuth() {
       authState.enabled = false;
       authState.status = 'disabled';
       renderAuth();
+      render();
       return;
     }
 
@@ -547,6 +1036,7 @@ async function initAuth() {
       authState.enabled = false;
       authState.status = 'disabled';
       renderAuth();
+      render();
       return;
     }
 
@@ -570,16 +1060,48 @@ async function initAuth() {
     authState.enabled = true;
     authState.user = session?.user || null;
     authState.status = authState.user ? 'signed_in' : 'signed_out';
+    authState.providerError = '';
+    if (authState.user) {
+      await syncUserProfile(authState.user);
+      const profile = await fetchUserProfile(authState.user.id);
+      setPreferencesFromSource(profile || defaultPreferences());
+      if (needsBlockingOnboarding()) {
+        setOnboardingMode('blocking');
+      } else {
+        setOnboardingMode(null);
+      }
+      await refreshRemoteData({ silent: true });
+    } else {
+      resetRemoteData();
+      setOnboardingMode(null);
+    }
     renderAuth();
+    render();
 
     if (authSubscription?.subscription?.unsubscribe) {
       authSubscription.subscription.unsubscribe();
     }
 
-    const { data } = supabaseClient.auth.onAuthStateChange((_event, nextSession) => {
+    const { data } = supabaseClient.auth.onAuthStateChange(async (_event, nextSession) => {
       authState.user = nextSession?.user || null;
       authState.status = authState.user ? 'signed_in' : 'signed_out';
+      if (authState.user) {
+        authState.providerError = '';
+        await syncUserProfile(authState.user);
+        const profile = await fetchUserProfile(authState.user.id);
+        setPreferencesFromSource(profile || defaultPreferences());
+        if (needsBlockingOnboarding()) {
+          setOnboardingMode('blocking');
+        } else if (state.ui.onboardingMode === 'blocking') {
+          setOnboardingMode(null);
+        }
+        await refreshRemoteData({ silent: true });
+      } else {
+        resetRemoteData();
+        setOnboardingMode(null);
+      }
       renderAuth();
+      render();
     });
     authSubscription = data;
   } catch (error) {
@@ -587,6 +1109,7 @@ async function initAuth() {
     authState.enabled = false;
     authState.status = 'disabled';
     renderAuth();
+    render();
   }
 }
 
@@ -603,6 +1126,14 @@ async function signInWithGoogle() {
   });
 
   if (error) {
+    const msg = String(error.message || '').toLowerCase();
+    if (msg.includes('provider is not enabled') || msg.includes('unsupported provider')) {
+      authState.providerError = 'Google provider is disabled in Supabase. Enable it in Authentication > Providers > Google, then retry.';
+      render();
+      toast('Google login disabled in Supabase');
+      return;
+    }
+
     toast('Could not start Google sign in');
     console.warn('Google sign in failed:', error.message);
   }
@@ -624,13 +1155,20 @@ function loadState() {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) return structuredClone(DEFAULT_STATE);
     const parsed = JSON.parse(raw);
+
+    const parsedUi = parsed.ui || {};
+    const parsedPreferences = parsed.preferences || {};
+
     return {
       ...structuredClone(DEFAULT_STATE),
       ...parsed,
       ui: {
         ...structuredClone(DEFAULT_STATE).ui,
-        ...(parsed.ui || {})
+        ...parsedUi,
+        onboardingMode: parsedUi.onboardingMode === 'edit' ? 'edit' : null,
+        onboardingStep: Number.isInteger(parsedUi.onboardingStep) ? parsedUi.onboardingStep : 0
       },
+      preferences: normalizePreferences(parsedPreferences),
       analytics: {
         events: Array.isArray(parsed.analytics?.events) ? parsed.analytics.events : []
       },
@@ -662,7 +1200,8 @@ function getEpisode(id) {
 }
 
 function getVariant(episode) {
-  return episode.variants[APP_LANGUAGE] || episode.variants.English;
+  const language = activeLanguage();
+  return episode.variants[language] || episode.variants.English;
 }
 
 function isReleased(episode, now = new Date()) {
@@ -725,6 +1264,316 @@ function continueListening() {
   });
 }
 
+function isOnboardingActive() {
+  return state.ui.onboardingMode === 'blocking' || state.ui.onboardingMode === 'edit';
+}
+
+function onboardingSteps() {
+  const topics = allTopicOptions();
+  const topicMin = topics.length > 0 ? 1 : 0;
+  return [
+    {
+      id: 'preferred_language',
+      title: 'Choose your language',
+      helper: 'We will prioritize episode transcripts and playback in this language.',
+      type: 'single',
+      options: LANGUAGE_OPTIONS,
+      min: 1,
+      max: 1
+    },
+    {
+      id: 'goals',
+      title: 'Pick your goals',
+      helper: 'Select 1-2 goals so we can focus your recommendations.',
+      type: 'multi',
+      options: GOAL_OPTIONS,
+      min: 1,
+      max: 2
+    },
+    {
+      id: 'preferred_tags',
+      title: 'Pick topics you care about',
+      helper:
+        topics.length > 0
+          ? 'Select 1-3 topics from our episode catalog.'
+          : 'Topics will appear after episodes are published. You can update this later.',
+      type: 'multi',
+      options: topics,
+      min: topicMin,
+      max: 3
+    },
+    {
+      id: 'preferred_episode_length_min',
+      title: 'Preferred episode length',
+      helper: 'Choose the length you are most likely to complete regularly.',
+      type: 'single',
+      options: LENGTH_OPTIONS.map((item) => String(item)),
+      min: 1,
+      max: 1
+    },
+    {
+      id: 'preferred_time_slot',
+      title: 'Best listening time',
+      helper: 'We will lightly boost episodes that fit this listening window.',
+      type: 'single',
+      options: TIME_SLOT_OPTIONS,
+      min: 1,
+      max: 1
+    }
+  ];
+}
+
+function currentOnboardingStepConfig() {
+  const steps = onboardingSteps();
+  const index = Math.min(Math.max(state.ui.onboardingStep || 0, 0), steps.length - 1);
+  return {
+    steps,
+    index,
+    config: steps[index]
+  };
+}
+
+function selectionCountForStep(config, draft) {
+  if (config.type === 'single') {
+    return draft[config.id] ? 1 : 0;
+  }
+  return Array.isArray(draft[config.id]) ? draft[config.id].length : 0;
+}
+
+function validateOnboardingStep(stepIndex, draft) {
+  const steps = onboardingSteps();
+  const config = steps[stepIndex];
+  if (!config) return { ok: false, message: 'Invalid step' };
+
+  if (config.id === 'preferred_language') {
+    const ok = LANGUAGE_OPTIONS.includes(draft.preferred_language);
+    return ok ? { ok: true } : { ok: false, message: 'Please choose one language.' };
+  }
+
+  if (config.id === 'goals') {
+    const count = Array.isArray(draft.goals) ? draft.goals.length : 0;
+    if (count < 1 || count > 2) {
+      return { ok: false, message: 'Choose 1-2 goals before continuing.' };
+    }
+    return { ok: true };
+  }
+
+  if (config.id === 'preferred_tags') {
+    const count = Array.isArray(draft.preferred_tags) ? draft.preferred_tags.length : 0;
+    const min = Number(config.min ?? 1);
+    const max = Number(config.max ?? 3);
+    if (count < min || count > max) {
+      return {
+        ok: false,
+        message: min > 0 ? `Choose ${min}-${max} topics before continuing.` : `Choose up to ${max} topics before continuing.`
+      };
+    }
+    return { ok: true };
+  }
+
+  if (config.id === 'preferred_episode_length_min') {
+    const ok = LENGTH_OPTIONS.includes(Number(draft.preferred_episode_length_min));
+    return ok ? { ok: true } : { ok: false, message: 'Choose your preferred episode length.' };
+  }
+
+  if (config.id === 'preferred_time_slot') {
+    const ok = TIME_SLOT_OPTIONS.includes(draft.preferred_time_slot);
+    return ok ? { ok: true } : { ok: false, message: 'Choose your preferred listening time.' };
+  }
+
+  return { ok: false, message: 'Please complete this step.' };
+}
+
+function toggleDraftChoice(field, value, maxCount) {
+  const current = Array.isArray(onboardingDraft[field]) ? onboardingDraft[field] : [];
+  const exists = current.includes(value);
+  if (exists) {
+    onboardingDraft[field] = current.filter((item) => item !== value);
+    return;
+  }
+
+  if (current.length >= maxCount) {
+    toast(`You can select up to ${maxCount} options.`);
+    return;
+  }
+
+  onboardingDraft[field] = [...current, value];
+}
+
+function handleOnboardingSelection(field, rawValue) {
+  if (onboardingSaving) return;
+  const value = String(rawValue || '').trim();
+  if (!value) return;
+
+  if (field === 'preferred_language' && LANGUAGE_OPTIONS.includes(value)) {
+    onboardingDraft.preferred_language = value;
+  }
+
+  if (field === 'goals' && GOAL_OPTIONS.includes(value)) {
+    toggleDraftChoice(field, value, 2);
+  }
+
+  if (field === 'preferred_tags') {
+    const normalized = value.toLowerCase();
+    const topics = allTopicOptions();
+    if (topics.includes(normalized)) {
+      toggleDraftChoice(field, normalized, 3);
+    }
+  }
+
+  if (field === 'preferred_episode_length_min' && LENGTH_OPTIONS.includes(Number(value))) {
+    onboardingDraft.preferred_episode_length_min = Number(value);
+  }
+
+  if (field === 'preferred_time_slot' && TIME_SLOT_OPTIONS.includes(value)) {
+    onboardingDraft.preferred_time_slot = value;
+  }
+
+  render();
+}
+
+function openPreferencesEditor() {
+  if (!isUserSignedIn()) return;
+  setOnboardingMode('edit');
+  render();
+}
+
+function cancelOnboardingEditor() {
+  if (state.ui.onboardingMode !== 'edit') return;
+  onboardingDraft = normalizePreferences(state.preferences);
+  setOnboardingMode(null);
+  render();
+}
+
+function goToNextOnboardingStep() {
+  const { steps, index } = currentOnboardingStepConfig();
+  const validation = validateOnboardingStep(index, onboardingDraft);
+  if (!validation.ok) {
+    toast(validation.message);
+    return;
+  }
+
+  state.ui.onboardingStep = Math.min(index + 1, steps.length - 1);
+  persist();
+  render();
+}
+
+function goToPreviousOnboardingStep() {
+  const { index } = currentOnboardingStepConfig();
+  state.ui.onboardingStep = Math.max(index - 1, 0);
+  persist();
+  render();
+}
+
+async function finishOnboarding() {
+  if (!authState.user?.id || !supabaseClient || onboardingSaving) return;
+
+  const steps = onboardingSteps();
+  for (let i = 0; i < steps.length; i += 1) {
+    const validation = validateOnboardingStep(i, onboardingDraft);
+    if (!validation.ok) {
+      state.ui.onboardingStep = i;
+      persist();
+      render();
+      toast(validation.message);
+      return;
+    }
+  }
+
+  onboardingSaving = true;
+  render();
+
+  const payload = {
+    ...profilePayloadFromUser(authState.user),
+    ...preferencesPayload({
+      ...onboardingDraft,
+      onboarding_completed: true
+    })
+  };
+
+  const saved = await upsertUserProfile(payload, { showToastOnError: true });
+
+  onboardingSaving = false;
+
+  if (!saved) {
+    render();
+    return;
+  }
+
+  setPreferencesFromSource(payload);
+  setOnboardingMode(null);
+  await refreshRemoteData({ silent: true });
+  toast('Preferences saved');
+  render();
+}
+
+function goalTagSet(goals) {
+  const set = new Set();
+  (goals || []).forEach((goal) => {
+    const mapped = GOAL_TAG_MAP[goal] || [];
+    mapped.forEach((tag) => set.add(tag));
+  });
+  return set;
+}
+
+function countOverlap(baseTags, preferenceTags) {
+  const prefSet = new Set((preferenceTags || []).map((item) => String(item).toLowerCase()));
+  return baseTags.filter((tag) => prefSet.has(tag)).length;
+}
+
+function recommendationForEpisode(episode, preferences) {
+  const episodeTags = episode.tags.map((tag) => String(tag).toLowerCase());
+  const topicOverlap = countOverlap(episodeTags, preferences.preferred_tags);
+  const topicScore = Math.min(topicOverlap * 4, 12);
+
+  const goalTags = Array.from(goalTagSet(preferences.goals));
+  const goalOverlap = countOverlap(episodeTags, goalTags);
+  const goalScore = Math.min(goalOverlap * 3, 9);
+
+  let durationScore = 0;
+  const preferredLength = Number(preferences.preferred_episode_length_min);
+  if (preferredLength === episode.durationMin) {
+    durationScore = 2;
+  } else if (Math.abs(preferredLength - episode.durationMin) <= 2) {
+    durationScore = 1;
+  }
+
+  const slotTags = TIME_SLOT_TAG_MAP[preferences.preferred_time_slot] || [];
+  const slotOverlap = countOverlap(episodeTags, slotTags);
+  const timeScore = slotOverlap > 0 ? 1 : 0;
+
+  const score = topicScore + goalScore + durationScore + timeScore;
+
+  let reason = 'Recommended from latest releases';
+  if (topicOverlap > 0) {
+    reason = `${topicOverlap} topic match${topicOverlap === 1 ? '' : 'es'}`;
+  } else if (goalOverlap > 0) {
+    reason = 'Aligned with your goals';
+  } else if (durationScore === 2) {
+    reason = 'Matches your preferred length';
+  } else if (timeScore > 0 && preferences.preferred_time_slot) {
+    reason = `Fits your ${preferences.preferred_time_slot.toLowerCase()} listening`;
+  }
+
+  return {
+    episode,
+    score,
+    reason
+  };
+}
+
+function forYouRecommendations() {
+  const released = getReleasedEpisodes();
+  const preferences = normalizePreferences(state.preferences);
+  return released
+    .map((episode) => recommendationForEpisode(episode, preferences))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return b.episode.releaseAt - a.episode.releaseAt;
+    })
+    .slice(0, 6);
+}
+
 function filterScheduleList(list) {
   const query = state.ui.search.trim().toLowerCase();
   const filter = state.ui.filter;
@@ -746,17 +1595,21 @@ function filterScheduleList(list) {
 }
 
 function toggleSave(id) {
+  let nextSaved = false;
   if (state.savedIds.includes(id)) {
     state.savedIds = state.savedIds.filter((entry) => entry !== id);
+    nextSaved = false;
     toast('Removed from library');
     track('unsave_episode', { episodeId: id });
   } else {
     state.savedIds = [id, ...state.savedIds];
+    nextSaved = true;
     toast('Saved to library');
     track('save_episode', { episodeId: id });
   }
   persist();
   render();
+  syncSaveToApi(id, nextSaved);
 }
 
 function ensureRecent(id) {
@@ -789,10 +1642,13 @@ function startPlayback(id, percent = progressOf(id)) {
   startTick();
   playSpeechFromCurrent();
   render();
+  syncProgressToApi({ episodeId: id, percent, event: 'start' });
 }
 
 function pausePlayback() {
   if (state.player.status !== 'playing') return;
+  const episodeId = state.player.episodeId;
+  const percent = state.player.percent;
   state.player.status = 'paused';
   track('pause_playback', { episodeId: state.player.episodeId });
   persist();
@@ -803,6 +1659,7 @@ function pausePlayback() {
   }
 
   renderPlayer();
+  syncProgressToApi({ episodeId, percent });
 }
 
 function resumePlayback() {
@@ -824,14 +1681,16 @@ function resumePlayback() {
 }
 
 function stopPlayback(showMessage = false) {
+  const episodeId = state.player.episodeId;
+  const percent = state.player.percent;
   clearTick();
   clearSleepTimer();
   stopSpeech();
 
-  if (state.player.episodeId) {
+  if (episodeId) {
     track('stop_playback', {
-      episodeId: state.player.episodeId,
-      percent: state.player.percent
+      episodeId,
+      percent
     });
   }
 
@@ -844,6 +1703,7 @@ function stopPlayback(showMessage = false) {
   if (showMessage) toast('Playback stopped');
 
   render();
+  syncProgressToApi({ episodeId, percent, refreshDashboard: true });
 }
 
 function completePlayback() {
@@ -865,6 +1725,7 @@ function completePlayback() {
 
   toast('Episode complete');
   render();
+  syncProgressToApi({ episodeId, percent: 100, refreshDashboard: true });
 }
 
 function seekPlayback(percent) {
@@ -972,11 +1833,116 @@ function playSpeechFromCurrent() {
   speechToken = new SpeechSynthesisUtterance(chunk);
   speechToken.rate = Number(state.player.speed);
   speechToken.pitch = 1;
-  speechToken.lang = APP_LANGUAGE === 'Hindi' ? 'hi-IN' : 'en-IN';
+  speechToken.lang = speechLocaleForLanguage(activeLanguage());
   speechSynthesis.speak(speechToken);
 }
 
+function prettyTopic(topic) {
+  return topic
+    .split(' ')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function onboardingOptionButtons(config) {
+  if (!config) return '';
+  const currentValue = onboardingDraft[config.id];
+
+  return config.options
+    .map((option) => {
+      const value = String(option);
+      const display = config.id === 'preferred_tags' ? prettyTopic(value) : value;
+      const selected =
+        config.type === 'single'
+          ? String(currentValue) === value
+          : Array.isArray(currentValue) && currentValue.includes(value);
+
+      return `
+        <button
+          type="button"
+          class="option-btn ${selected ? 'active' : ''}"
+          data-action="onboarding-select"
+          data-field="${config.id}"
+          data-value="${escapeHtml(value)}"
+          ${onboardingSaving ? 'disabled' : ''}
+        >
+          ${escapeHtml(display)}
+        </button>
+      `;
+    })
+    .join('');
+}
+
+function renderOnboardingFlow() {
+  const { steps, index, config } = currentOnboardingStepConfig();
+  const total = steps.length;
+  const selectedCount = selectionCountForStep(config, onboardingDraft);
+  const isLast = index === total - 1;
+  const isBlocking = state.ui.onboardingMode === 'blocking';
+  const progressPercent = Math.round(((index + 1) / total) * 100);
+  const countHint =
+    config.type === 'multi'
+      ? `Selected ${selectedCount} of ${config.max} (min ${config.min})`
+      : selectedCount
+        ? 'Selection complete'
+        : 'Select one option';
+
+  appEl.innerHTML = `
+    <section class="onboard card">
+      <div class="onboard-card">
+        <p class="kicker">${isBlocking ? 'Complete Setup' : 'Preferences'}</p>
+        <h2>Personalize your listening</h2>
+        <p class="helper">Step ${index + 1} of ${total} · ${progressPercent}% complete</p>
+        <div class="progress"><span style="width:${progressPercent}%;"></span></div>
+
+        <div class="empty">
+          <p class="label">${escapeHtml(config.title)}</p>
+          <p class="note">${escapeHtml(config.helper)}</p>
+          <p class="note" style="margin-top:0.45rem;">${countHint}</p>
+          <div class="onboard-grid" style="margin-top:0.8rem;">
+            ${onboardingOptionButtons(config)}
+          </div>
+        </div>
+
+        <div class="onboard-actions">
+          <div class="actions">
+            <button type="button" class="soft-btn" data-action="onboarding-back" ${index === 0 || onboardingSaving ? 'disabled' : ''}>Back</button>
+            ${!isBlocking ? `<button type="button" class="ghost-btn" data-action="onboarding-cancel" ${onboardingSaving ? 'disabled' : ''}>Cancel</button>` : ''}
+          </div>
+          <div class="actions">
+            ${!isLast ? `<button type="button" class="primary-btn" data-action="onboarding-next" ${onboardingSaving ? 'disabled' : ''}>Next</button>` : `<button type="button" class="primary-btn" data-action="onboarding-finish" ${onboardingSaving ? 'disabled' : ''}>${onboardingSaving ? 'Saving...' : 'Finish'}</button>`}
+          </div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 function render() {
+  const signedIn = isUserSignedIn();
+  if (resetButton) {
+    resetButton.hidden = !signedIn;
+  }
+  if (preferencesButton) {
+    preferencesButton.hidden = !signedIn || state.ui.onboardingMode === 'blocking';
+  }
+
+  if (!signedIn) {
+    renderAuthGate();
+    hideOverlays();
+    return;
+  }
+
+  if (needsBlockingOnboarding() && state.ui.onboardingMode !== 'edit' && state.ui.onboardingMode !== 'blocking') {
+    setOnboardingMode('blocking');
+  }
+
+  if (isOnboardingActive()) {
+    renderOnboardingFlow();
+    hideOverlays();
+    return;
+  }
+
   renderMain();
   renderModal();
   renderPlayer();
@@ -987,45 +1953,106 @@ function renderMain() {
   const released = getReleasedEpisodes();
   const upcoming = getUpcomingEpisodes();
   const active = continueListening();
+  const forYou = remoteData.recommendations.length ? remoteData.recommendations : forYouRecommendations();
   const firstReleaseDate = EPISODES[0]?.releaseAt;
+  const dashboardStats = remoteData.dashboard?.stats || null;
+  const releasedCountFromApi = Number.isFinite(Number(dashboardStats?.released_count))
+    ? Number(dashboardStats.released_count)
+    : 0;
+  const upcomingCountFromApi = Number.isFinite(Number(dashboardStats?.upcoming_count))
+    ? Number(dashboardStats.upcoming_count)
+    : 0;
+  const savedCountFromApi = Number.isFinite(Number(dashboardStats?.saved_count))
+    ? Number(dashboardStats.saved_count)
+    : 0;
+  const continueCountFromApi = Number.isFinite(Number(dashboardStats?.continue_listening_count))
+    ? Number(dashboardStats.continue_listening_count)
+    : 0;
+  const startCountFromApi = Number.isFinite(Number(dashboardStats?.play_starts_count))
+    ? Number(dashboardStats.play_starts_count)
+    : 0;
+
+  const releasedCount = Math.max(released.length, releasedCountFromApi);
+  const upcomingCount = Math.max(upcoming.length, upcomingCountFromApi);
+  const savedCount = Math.max(state.savedIds.length, savedCountFromApi);
+  const continueCount = Math.max(active.length, continueCountFromApi);
+  const startCount = Math.max(
+    state.analytics.events.filter((entry) => entry.event === 'start_playback').length,
+    startCountFromApi
+  );
+
+  const featuredPick = remoteData.dashboard?.featured || forYou[0] || (latest ? { episode: latest, reason: 'Newest release for you' } : null);
+  const featuredEpisode = featuredPick?.episode || null;
+  const featuredVariant = featuredEpisode ? getVariant(featuredEpisode) : null;
+  const featuredReleased = featuredEpisode ? isReleased(featuredEpisode) : false;
+  const todayLabel = new Date().toLocaleDateString('en-IN', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'short'
+  });
+  const rawName = remoteData.me?.user?.full_name || remoteData.dashboard?.user?.full_name || authDisplayName(authState.user);
+  const firstName = rawName.includes('@')
+    ? rawName.split('@')[0]
+    : rawName
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)[0] || 'there';
 
   appEl.innerHTML = `
-    <section class="hero card">
-      <div class="hero-grid">
-        <div>
-          <p class="kicker">New Episode Drops</p>
-          <h2>GitaFlow release stream</h2>
-          <p class="helper">No preference setup. Episodes drop on schedule and appear here as new releases.</p>
-          <div class="badges">
-            <span class="pill">Language: ${APP_LANGUAGE}</span>
-            <span class="pill">Released: ${released.length}</span>
-            <span class="pill">Upcoming: ${upcoming.length}</span>
+    <section class="home-hero card">
+      <div class="home-hero-grid">
+        <div class="home-hero-main">
+          <p class="kicker">Daily Momentum • ${todayLabel}</p>
+          <h2>${escapeHtml(firstName)}, your mindful stream is ready</h2>
+          <p class="helper">Built around your language, goals, topics, preferred length, and listening time.</p>
+          <div class="hero-pills">
+            <span class="hero-pill">Language: ${activeLanguage()}</span>
+            <span class="hero-pill">${releasedCount} released</span>
+            <span class="hero-pill">${upcomingCount} upcoming</span>
+            <span class="hero-pill">${savedCount} saved</span>
           </div>
           ${latest ? `
             <div class="actions">
-              <button class="primary-btn" data-action="play" data-id="${latest.id}">Play New Release</button>
-              <button class="soft-btn" data-action="open" data-id="${latest.id}">Open Episode</button>
+              <button class="primary-btn" data-action="play" data-id="${latest.id}">Play Latest</button>
+              <button class="soft-btn" data-action="open" data-id="${latest.id}">View Episode</button>
             </div>
           ` : '<p class="note">First release is coming soon.</p>'}
         </div>
-        <div class="stats">
-          <article class="stat">
-            <span class="label">Latest Release</span>
-            <strong>${latest ? latest.title : 'Not Released Yet'}</strong>
-            <p class="note">${latest ? `${releaseBadge(latest)} | ${formatDate(latest.releaseAt)}` : firstReleaseDate ? `Starts ${formatDate(firstReleaseDate)}` : 'Release schedule updating'}</p>
+
+        ${featuredEpisode ? `
+          <article class="hero-spotlight">
+            <p class="label">Best Match Right Now</p>
+            <h3>${featuredEpisode.title}</h3>
+            <p class="summary">${featuredVariant.summary}</p>
+            ${featuredPick.reason ? `<p class="match-reason">${escapeHtml(featuredPick.reason)}</p>` : ''}
+            <div class="quick">
+              ${featuredEpisode.tags.slice(0, 3).map((tag) => `<span class="pill">${tag}</span>`).join('')}
+            </div>
+            <div class="actions">
+              <button class="primary-btn" data-action="play" data-id="${featuredEpisode.id}" ${featuredReleased ? '' : 'disabled'}>${featuredReleased ? 'Play This' : 'Releases Soon'}</button>
+              <button class="soft-btn" data-action="open" data-id="${featuredEpisode.id}">Details</button>
+            </div>
           </article>
-          <article class="stat">
-            <span class="label">Saved</span>
-            <strong>${state.savedIds.length}</strong>
-            <p class="note">Bookmarked episodes in your local library.</p>
-          </article>
-          <article class="stat">
-            <span class="label">Play Starts</span>
-            <strong>${state.analytics.events.filter((entry) => entry.event === 'start_playback').length}</strong>
-            <p class="note">Local analytics count from this browser.</p>
-          </article>
-        </div>
+        ` : ''}
       </div>
+    </section>
+
+    <section class="home-metrics">
+      <article class="dash-stat card">
+        <span class="label">Latest Release</span>
+        <strong>${latest ? latest.title : 'Not Released Yet'}</strong>
+        <p class="note">${latest ? `${releaseBadge(latest)} | ${formatDate(latest.releaseAt)}` : firstReleaseDate ? `Starts ${formatDate(firstReleaseDate)}` : 'Release schedule updating'}</p>
+      </article>
+      <article class="dash-stat card">
+        <span class="label">Continue Listening</span>
+        <strong>${continueCount}</strong>
+        <p class="note">${continueCount ? 'Pick up where you left off in one tap.' : 'Start one episode to build your rhythm.'}</p>
+      </article>
+      <article class="dash-stat card">
+        <span class="label">Play Starts</span>
+        <strong>${startCount}</strong>
+        <p class="note">Local listening starts tracked on this device.</p>
+      </article>
     </section>
 
     <section class="tabs card">
@@ -1034,6 +2061,7 @@ function renderMain() {
       ${tabButton('schedule', 'Schedule')}
     </section>
 
+    ${state.tab === 'home' ? personalizedSection(forYou) : ''}
     ${latest ? latestSection(latest) : ''}
     ${state.tab === 'home' ? shelfSection('Continue Listening', 'Resume your in-progress episodes.', active) : ''}
     ${state.tab === 'home' ? shelfSection('Latest Drops', 'Most recently released episodes.', released.slice(0, 6)) : ''}
@@ -1071,6 +2099,40 @@ function latestSection(episode) {
   `;
 }
 
+function personalizedSection(items) {
+  if (!items.length) return '';
+  const [first, ...rest] = items;
+  const secondary = rest.length ? rest : [first];
+
+  return `
+    <section class="section card for-you">
+      <div class="section-head">
+        <div>
+          <p class="label">For You</p>
+          <h3>Your tailored queue</h3>
+        </div>
+        <p class="note">Ranked by goals, topics, length, and time slot match.</p>
+      </div>
+      <div class="for-you-layout">
+        <div class="for-you-feature">
+          ${episodeCard(first.episode, {
+            matchReason: first.reason
+          })}
+        </div>
+        <div class="for-you-list">
+          ${secondary
+            .map((item) =>
+              episodeCard(item.episode, {
+                matchReason: item.reason
+              })
+            )
+            .join('')}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 function shelfSection(title, description, episodes) {
   if (!episodes.length) {
     return '';
@@ -1085,7 +2147,7 @@ function shelfSection(title, description, episodes) {
         </div>
         <p class="note">${description}</p>
       </div>
-      <div class="row-scroll">
+      <div class="shelf-grid">
         ${episodes.map((episode) => episodeCard(episode)).join('')}
       </div>
     </section>
@@ -1142,10 +2204,11 @@ function emptyState(title, body) {
   return `<div class="empty"><h4>${title}</h4><p>${body}</p></div>`;
 }
 
-function episodeCard(episode) {
+function episodeCard(episode, options = {}) {
   const variant = getVariant(episode);
   const percent = progressOf(episode.id);
   const released = isReleased(episode);
+  const matchReason = options.matchReason ? escapeHtml(options.matchReason) : '';
 
   return `
     <article class="episode">
@@ -1157,6 +2220,7 @@ function episodeCard(episode) {
         <span class="pill">${episode.durationMin}m</span>
       </div>
       <p class="summary">${variant.summary}</p>
+      ${matchReason ? `<p class="match-reason">${matchReason}</p>` : ''}
       <div class="quick">
         ${episode.tags.slice(0, 3).map((tag) => `<span class="pill">${tag}</span>`).join('')}
       </div>
@@ -1264,7 +2328,7 @@ function renderPlayer() {
           <h4>${episode.title}</h4>
           <p class="note">${variant.summary}</p>
           <div class="player-meta">
-            <span class="pill">${APP_LANGUAGE}</span>
+            <span class="pill">${activeLanguage()}</span>
             <span class="pill">${episode.durationMin} min</span>
             <span class="pill">${state.player.status}</span>
           </div>
@@ -1338,6 +2402,7 @@ function escapeHtml(value) {
 function resetLocalData() {
   stopPlayback(false);
   state = structuredClone(DEFAULT_STATE);
+  onboardingDraft = normalizePreferences(state.preferences);
   persist();
   render();
   toast('Local data reset');
@@ -1349,6 +2414,50 @@ document.addEventListener('click', (event) => {
 
   const action = target.dataset.action;
   const id = target.dataset.id;
+
+  if (action === 'auth-google') {
+    signInWithGoogle();
+    return;
+  }
+
+  if (action === 'auth-logout') {
+    signOutUser();
+    return;
+  }
+
+  if (!isUserSignedIn()) return;
+
+  if (action === 'open-preferences') {
+    openPreferencesEditor();
+    return;
+  }
+
+  if (action === 'onboarding-select') {
+    handleOnboardingSelection(target.dataset.field, target.dataset.value);
+    return;
+  }
+
+  if (action === 'onboarding-next') {
+    goToNextOnboardingStep();
+    return;
+  }
+
+  if (action === 'onboarding-back') {
+    goToPreviousOnboardingStep();
+    return;
+  }
+
+  if (action === 'onboarding-finish') {
+    finishOnboarding();
+    return;
+  }
+
+  if (action === 'onboarding-cancel') {
+    cancelOnboardingEditor();
+    return;
+  }
+
+  if (isOnboardingActive()) return;
 
   if (action === 'play') startPlayback(id);
   if (action === 'open') openEpisode(id);
@@ -1370,8 +2479,6 @@ document.addEventListener('click', (event) => {
   if (action === 'pause') pausePlayback();
   if (action === 'resume') resumePlayback();
   if (action === 'stop') stopPlayback(true);
-  if (action === 'auth-google') signInWithGoogle();
-  if (action === 'auth-logout') signOutUser();
 
   if (action === 'toggle-transcript') {
     state.player.transcriptOpen = !state.player.transcriptOpen;
@@ -1381,6 +2488,9 @@ document.addEventListener('click', (event) => {
 });
 
 document.addEventListener('input', (event) => {
+  if (!isUserSignedIn()) return;
+  if (isOnboardingActive()) return;
+
   if (event.target.id === 'searchInput') {
     state.ui.search = event.target.value;
     persist();
@@ -1413,13 +2523,14 @@ document.addEventListener('keydown', (event) => {
 });
 
 resetButton.addEventListener('click', () => {
+  if (!isUserSignedIn()) return;
   resetLocalData();
 });
 
 async function bootstrap() {
   render();
   renderAuth();
-  await Promise.all([hydrateEpisodesFromApi(), initAuth()]);
+  await Promise.all([initAuth(), hydrateEpisodesFromApi()]);
 }
 
 bootstrap();

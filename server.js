@@ -60,6 +60,21 @@ function sendFile(res, filePath) {
   });
 }
 
+function hasLocalApiHandler(apiPathname) {
+  const apiName = apiPathname.replace(/^\/api\//, '');
+  if (!apiName || apiName.includes('/') || apiName.includes('\\')) return false;
+  const candidate = path.join(ROOT, 'api', `${apiName}.js`);
+  return fs.existsSync(candidate);
+}
+
+async function runLocalApiHandler(req, res, apiPathname) {
+  const apiName = apiPathname.replace(/^\/api\//, '');
+  const handlerPath = path.join(ROOT, 'api', `${apiName}.js`);
+  delete require.cache[require.resolve(handlerPath)];
+  const handler = require(handlerPath);
+  await handler(req, res);
+}
+
 function loadEnvFile() {
   try {
     const raw = fs.readFileSync(ENV_PATH, 'utf8');
@@ -292,6 +307,16 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/api/auth-config') {
     sendJson(res, 200, getPublicAuthConfig());
+    return;
+  }
+
+  if (url.pathname.startsWith('/api/') && hasLocalApiHandler(url.pathname)) {
+    runLocalApiHandler(req, res, url.pathname).catch((error) => {
+      sendJson(res, 500, {
+        error: 'Local API handler failed',
+        details: error.message
+      });
+    });
     return;
   }
 
